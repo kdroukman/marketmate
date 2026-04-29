@@ -274,7 +274,7 @@ Resources:
           Environment=DEEPEVAL_FILE_SYSTEM=READ_ONLY
           Environment=DEEPEVAL_TELEMETRY_OPT_OUT=YES
           EnvironmentFile=-/etc/marketmate/marketmate.env
-          ExecStart=/opt/marketmate/repo/${AppSubdirectory}/.venv/bin/python app.py
+          ExecStart=/opt/marketmate/repo/${AppSubdirectory}/.venv/bin/opentelemetry-instrument /opt/marketmate/repo/${AppSubdirectory}/.venv/bin/python app.py
           Restart=always
           RestartSec=5
 

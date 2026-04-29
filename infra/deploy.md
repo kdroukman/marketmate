@@ -15,9 +15,9 @@ This template is designed to be free-tier eligible, not guaranteed free:
 - SSH is opened only to the `SshIngressCidr` parameter and requires an existing EC2 key pair.
 - The app port defaults to `5273`.
 - The Splunk Distribution of OpenTelemetry Collector is installed using Splunk's Linux installer script.
-- The app exports OTLP to the local collector at `http://127.0.0.1:4318`. The Python OTLP HTTP exporter appends signal paths such as `/v1/traces`.
+- The app runs under `opentelemetry-instrument` and exports OTLP to the local collector at `http://127.0.0.1:4318`. The OTLP HTTP exporter appends signal paths such as `/v1/traces`.
 - The app and collector set `deployment.environment=marketmate` by default.
-- The app includes Splunk AI Agent Monitoring code-based GenAI instrumentation via `splunk-otel-util-genai`.
+- The app uses OpenAI Agents SDK and Splunk zero-code GenAI instrumentation via `splunk-otel-instrumentation-openai-agents`.
 - The app venv uses Python 3.11 because Splunk AI Agent Monitoring requires Python 3.10+ and Amazon Linux 2023's system Python is 3.9.
 - Splunk Observability, Splunk Cloud HEC, and OpenAI secrets are read from encrypted SSM SecureString parameters at boot.
 - Observability telemetry uses the Splunk Observability access token and realm `us1`.

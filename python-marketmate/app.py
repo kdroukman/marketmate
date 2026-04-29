@@ -3,13 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import ssl
-import subprocess
 import time
-import uuid
-import urllib.error
 import urllib.parse
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,8 +15,6 @@ STATIC_ROOT = ROOT / "static"
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5273"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-OPENAI_URL = "https://api.openai.com/v1/responses"
-CURRENT_WORKFLOW_RUN_ID: str | None = None
 
 
 logging.basicConfig(
@@ -33,88 +26,18 @@ app_logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 
 try:
-    from opentelemetry import trace
-    from opentelemetry import _logs
-    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, ConsoleLogExporter, SimpleLogRecordProcessor
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
-    from opentelemetry.trace import Status, StatusCode
+    from agents import Agent, ModelSettings, RunConfig, Runner, function_tool
 
-    resource = Resource.create({
-        "service.name": os.getenv("OTEL_SERVICE_NAME", "marketmate-python"),
-        "service.version": "1.0.0",
-    })
-    provider = TracerProvider(resource=resource)
-
-    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-    else:
-        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
-
-    trace.set_tracer_provider(provider)
-    tracer = trace.get_tracer("marketmate.agents")
-
-    log_provider = LoggerProvider(resource=resource)
-    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
-        log_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
-    else:
-        log_provider.add_log_record_processor(SimpleLogRecordProcessor(ConsoleLogExporter()))
-    _logs.set_logger_provider(log_provider)
-    app_logger.addHandler(LoggingHandler(level=logging.INFO, logger_provider=log_provider))
-
-    OTEL_ENABLED = True
+    AGENTS_SDK_ENABLED = True
 except ModuleNotFoundError:
-    OTEL_ENABLED = False
+    def function_tool(func: Any) -> Any:
+        return func
 
-    class _NoopSpan:
-        def __enter__(self) -> "_NoopSpan":
-            return self
-
-        def __exit__(self, *_args: Any) -> None:
-            return None
-
-        def set_attribute(self, *_args: Any) -> None:
-            return None
-
-        def record_exception(self, *_args: Any) -> None:
-            return None
-
-        def set_status(self, *_args: Any) -> None:
-            return None
-
-    class _NoopTracer:
-        def start_as_current_span(self, *_args: Any, **_kwargs: Any) -> _NoopSpan:
-            return _NoopSpan()
-
-    class StatusCode:
-        ERROR = "ERROR"
-
-    class Status:
-        def __init__(self, *_args: Any) -> None:
-            return None
-
-    tracer = _NoopTracer()
-
-try:
-    from opentelemetry.util.genai.handler import get_telemetry_handler
-    from opentelemetry.util.genai.types import (
-        AgentInvocation,
-        InputMessage,
-        LLMInvocation,
-        OutputMessage,
-        Text,
-        Workflow,
-    )
-
-    genai_handler = get_telemetry_handler()
-    GENAI_ENABLED = True
-except ModuleNotFoundError:
-    genai_handler = None
-    GENAI_ENABLED = False
+    Agent = None
+    ModelSettings = None
+    RunConfig = None
+    Runner = None
+    AGENTS_SDK_ENABLED = False
 
 
 GROCERY_ITEM_SCHEMA: dict[str, Any] = {
@@ -236,85 +159,6 @@ class AppError(Exception):
         self.status = status
 
 
-def output_text(payload: dict[str, Any]) -> str:
-    if isinstance(payload.get("output_text"), str):
-        return payload["output_text"]
-
-    parts: list[str] = []
-    for output in payload.get("output", []):
-        for content in output.get("content", []):
-            if isinstance(content.get("text"), str):
-                parts.append(content["text"])
-            if isinstance(content.get("output_text"), str):
-                parts.append(content["output_text"])
-    return "\n".join(parts)
-
-
-def run_curl_request(request_body: str, api_key: str) -> dict[str, Any]:
-    completed = subprocess.run(
-        [
-            "curl",
-            "-sS",
-            "--fail-with-body",
-            OPENAI_URL,
-            "-H",
-            "content-type: application/json",
-            "-H",
-            f"authorization: Bearer {api_key}",
-            "--data-binary",
-            "@-",
-        ],
-        input=request_body,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    if completed.returncode == 0:
-        return json.loads(completed.stdout)
-
-    try:
-        payload = json.loads(completed.stdout)
-        raise AppError(payload.get("error", {}).get("message", completed.stderr), completed.returncode)
-    except json.JSONDecodeError as error:
-        raise AppError(completed.stderr or "The curl LLM request failed.") from error
-
-
-def post_to_openai(request_body: str, api_key: str) -> dict[str, Any]:
-    with tracer.start_as_current_span("openai.responses") as span:
-        span.set_attribute("gen_ai.system", "openai")
-        span.set_attribute("gen_ai.request.model", MODEL)
-        span.set_attribute("http.method", "POST")
-        span.set_attribute("url.full", OPENAI_URL)
-
-        request = urllib.request.Request(
-            OPENAI_URL,
-            data=request_body.encode("utf-8"),
-            method="POST",
-            headers={
-                "content-type": "application/json",
-                "authorization": f"Bearer {api_key}",
-            },
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                span.set_attribute("http.response.status_code", response.status)
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            span.set_attribute("http.response.status_code", error.code)
-            body = error.read().decode("utf-8")
-            try:
-                payload = json.loads(body)
-                raise AppError(payload.get("error", {}).get("message", "The LLM request failed."), error.code)
-            except json.JSONDecodeError as json_error:
-                raise AppError(body or "The LLM request failed.", error.code) from json_error
-        except (TimeoutError, urllib.error.URLError, ssl.SSLError) as error:
-            span.record_exception(error)
-            span.set_attribute("openai.transport_fallback", "curl")
-            return run_curl_request(request_body, api_key)
-
-
 def clipped_text(value: Any, limit: int = 10_000) -> str:
     text = value if isinstance(value, str) else json.dumps(value, indent=2)
     if len(text) <= limit:
@@ -322,129 +166,142 @@ def clipped_text(value: Any, limit: int = 10_000) -> str:
     return f"{text[:limit]}... [truncated]"
 
 
-def genai_input_message(role: str, content: Any) -> Any:
-    return InputMessage(role=role, parts=[Text(content=clipped_text(content))])
+def parse_agent_json(raw_output: Any, title: str) -> dict[str, Any]:
+    if isinstance(raw_output, dict):
+        return raw_output
+
+    text = raw_output if isinstance(raw_output, str) else json.dumps(raw_output)
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise AppError(f"{title} returned non-JSON output: {text[:300]}") from error
 
 
-def set_eval_fields(invocation: Any, *, input_text: str | None = None, actual_output: Any | None = None) -> None:
-    attributes = getattr(invocation, "attributes", None)
-    if attributes is None:
-        attributes = {}
-        invocation.attributes = attributes
-    if input_text is not None:
-        clipped_input = clipped_text(input_text)
-        invocation.input = clipped_input
-        attributes["input"] = clipped_input
-        attributes.setdefault("prompt_capture", {})["input"] = clipped_input
-    if actual_output is not None:
-        clipped_output = clipped_text(actual_output)
-        invocation.actual_output = clipped_output
-        attributes["actual_output"] = clipped_output
-        attributes["output"] = clipped_output
-        attributes["output_result"] = clipped_output
-        attributes.setdefault("prompt_capture", {})["output_result"] = clipped_output
-
-
-def output_message(content: Any) -> Any:
-    return OutputMessage(
-        role="assistant",
-        parts=[Text(content=clipped_text(content))],
-        finish_reason="stop",
+def schema_instruction(name: str, schema: dict[str, Any]) -> str:
+    return (
+        "\n\nReturn only valid JSON. Do not wrap it in markdown. "
+        f"The JSON must satisfy this schema named {name}:\n{json.dumps(schema, indent=2)}"
     )
 
 
-def call_agent(name: str, title: str, instructions: str, input_data: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
+@function_tool
+def customer_context_lookup(request: str) -> str:
+    """Look up a customer's broad grocery preferences for a recipe planning request."""
+    return json.dumps({
+        "profile": "demo shopper",
+        "preferences": ["clear quantities", "practical supermarket products", "reasonable substitutions"],
+        "assumptions": ["budget-aware", "weeknight-friendly", "no live customer database access in demo mode"],
+        "request": request[:800],
+    })
+
+
+@function_tool
+def recipe_search(query: str) -> str:
+    """Search demo recipe content and return meal-planning hints."""
+    return json.dumps({
+        "source": "demo recipe knowledge base",
+        "matches": [
+            "pair mains with a vegetable side and a starch when appropriate",
+            "include garnishes and pantry staples only when useful",
+            "prefer ingredients that are easy to find in a mainstream grocery store",
+        ],
+        "query": query[:1200],
+    })
+
+
+@function_tool
+def product_catalog_search(ingredients: str) -> str:
+    """Map recipe ingredients to supermarket-style product names and aisles."""
+    return json.dumps({
+        "catalog": "demo product catalog",
+        "aisles": ["Produce", "Meat & Seafood", "Dairy", "Pantry", "Bakery", "Frozen", "Herbs & Spices"],
+        "rules": [
+            "dedupe overlapping ingredients",
+            "use familiar product names",
+            "keep quantities practical for one shopping trip",
+        ],
+        "ingredients": ingredients[:1200],
+    })
+
+
+@function_tool
+def store_inventory_check(cart: str) -> str:
+    """Review a demo cart for likely availability and substitution options."""
+    return json.dumps({
+        "store": "demo local store",
+        "availability": "assumed available unless specialty or seasonal",
+        "substitution_rules": [
+            "offer frozen or canned substitutes for hard-to-find produce",
+            "suggest similar proteins for seafood or meat constraints",
+            "avoid claiming live stock counts",
+        ],
+        "cart": cart[:1200],
+    })
+
+
+@function_tool
+def promotions_search(cart: str) -> str:
+    """Find demo loyalty and savings suggestions for a grocery cart."""
+    return json.dumps({
+        "loyalty_program": "MarketMate demo rewards",
+        "promotion_rules": [
+            "suggest pantry-size buys only when useful",
+            "surface optional add-ons rather than fake coupon values",
+            "avoid exact prices or live offers",
+        ],
+        "cart": cart[:1200],
+    })
+
+
+def call_agent(
+    name: str,
+    title: str,
+    instructions: str,
+    input_data: Any,
+    schema: dict[str, Any],
+    tools: list[Any] | None = None,
+) -> tuple[dict[str, Any], int]:
+    if not AGENTS_SDK_ENABLED or Agent is None or Runner is None or RunConfig is None or ModelSettings is None:
+        raise AppError("OpenAI Agents SDK is not installed. Run: pip install -r requirements.txt", 503)
+
     started_at = time.monotonic()
     app_logger.info("agent.start name=%s title=%s model=%s", name, title, MODEL)
-    evaluate_agent_output = name == "final_response_agent"
+    input_text = input_data if isinstance(input_data, str) else json.dumps(input_data, indent=2)
+    agent_tools = tools or []
+    tool_names = [getattr(tool, "name", getattr(tool, "__name__", "tool")) for tool in agent_tools]
+    tool_instruction = ""
+    if tool_names:
+        tool_instruction = f"\n\nBefore producing the final JSON, call the relevant tool from this list exactly once: {', '.join(tool_names)}."
 
-    with tracer.start_as_current_span(f"agent.{name}") as span:
-        span.set_attribute("agent.name", title)
-        span.set_attribute("gen_ai.request.model", MODEL)
-        input_text = input_data if isinstance(input_data, str) else json.dumps(input_data, indent=2)
-        genai_agent = None
-        genai_llm = None
-
-        request_body = json.dumps({
-            "model": MODEL,
-            "input": [
-                {"role": "system", "content": [{"type": "input_text", "text": instructions}]},
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": input_text}],
-                },
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": name,
-                    "strict": True,
-                    "schema": schema,
-                }
-            },
-        })
-
-        if GENAI_ENABLED and genai_handler:
-            input_messages = [
-                genai_input_message("system", instructions),
-                genai_input_message("user", input_text),
-            ]
-            agent_run_id = str(uuid.uuid4())
-            llm_run_id = str(uuid.uuid4())
-            genai_agent = AgentInvocation(
-                name=title,
-                agent_type=name.replace("_agent", ""),
-                model=MODEL,
-                system_instructions=instructions,
-                input_messages=input_messages,
-            )
-            genai_agent.run_id = agent_run_id
-            if CURRENT_WORKFLOW_RUN_ID:
-                genai_agent.parent_run_id = CURRENT_WORKFLOW_RUN_ID
-            genai_agent.sample_for_evaluation = evaluate_agent_output
-            set_eval_fields(genai_agent, input_text=input_text)
-            genai_handler.start_agent(genai_agent)
-
-            genai_llm = LLMInvocation(
-                request_model=MODEL,
-                operation="responses",
-                input_messages=input_messages,
-            )
-            genai_llm.run_id = llm_run_id
-            genai_llm.parent_run_id = agent_run_id
-            genai_llm.provider = "openai"
-            genai_llm.framework = "native-http"
-            genai_llm.sample_for_evaluation = False
-            set_eval_fields(genai_llm, input_text=input_text)
-            genai_handler.start_llm(genai_llm)
-
-        try:
-            payload = post_to_openai(request_body, os.environ["OPENAI_API_KEY"])
-            text = output_text(payload)
-            if not text:
-                raise AppError(f"{title} did not return parseable output text.")
-
-            parsed = json.loads(text)
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            span.set_attribute("agent.duration_ms", elapsed_ms)
-            span.set_attribute("agent.trace_detail", parsed.get("traceDetail", ""))
-
-            if genai_llm is not None:
-                set_eval_fields(genai_llm, actual_output=text)
-                genai_llm.output_messages = [output_message(text)]
-            if genai_agent is not None:
-                set_eval_fields(genai_agent, actual_output=parsed)
-                genai_agent.output_messages = [output_message(parsed)]
-                genai_agent.output_result = clipped_text(parsed)
-
-            app_logger.info("agent.complete name=%s title=%s duration_ms=%s", name, title, elapsed_ms)
-            return parsed, elapsed_ms
-        finally:
-            if GENAI_ENABLED and genai_handler:
-                if genai_llm is not None:
-                    genai_handler.stop_llm(genai_llm)
-                if genai_agent is not None:
-                    genai_handler.stop_agent(genai_agent)
+    agent = Agent(
+        name=title,
+        instructions=instructions + tool_instruction + schema_instruction(name, schema),
+        model=MODEL,
+        tools=agent_tools,
+        model_settings=ModelSettings(tool_choice="auto" if agent_tools else "none"),
+    )
+    result = Runner.run_sync(
+        agent,
+        input_text,
+        run_config=RunConfig(
+            workflow_name="MarketMate recipe shopping workflow",
+            trace_include_sensitive_data=True,
+            trace_metadata={"environment": os.getenv("ENVIRONMENT_NAME", "marketmate")},
+        ),
+    )
+    parsed = parse_agent_json(result.final_output, title)
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    app_logger.info("agent.complete name=%s title=%s duration_ms=%s", name, title, elapsed_ms)
+    return parsed, elapsed_ms
 
 
 def trace_event(step_id: str, title: str, detail: str, duration_ms: int | None = None) -> dict[str, str]:
@@ -481,130 +338,99 @@ def non_recipe_plan(orchestrator: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_shopping_plan(prompt: str) -> dict[str, Any]:
-    global CURRENT_WORKFLOW_RUN_ID
-
     if not os.getenv("OPENAI_API_KEY"):
         raise AppError("OPENAI_API_KEY is not set. Start the app with OPENAI_API_KEY=your_key python app.py.", 503)
 
-    with tracer.start_as_current_span("cart.response") as span:
-        span.set_attribute("recipe.prompt_length", len(prompt))
-        app_logger.info("workflow.start prompt_length=%s", len(prompt))
-        previous_workflow_run_id = CURRENT_WORKFLOW_RUN_ID
-        CURRENT_WORKFLOW_RUN_ID = str(uuid.uuid4())
-        genai_workflow = None
-        if GENAI_ENABLED and genai_handler:
-            genai_workflow = Workflow(
-                name="marketmate_recipe_shopping_workflow",
-                workflow_type="multi_agent_recipe_cart",
-                input_messages=[genai_input_message("user", prompt)],
-            )
-            genai_workflow.run_id = CURRENT_WORKFLOW_RUN_ID
-            set_eval_fields(genai_workflow, input_text=prompt)
-            genai_handler.start_workflow(genai_workflow)
+    app_logger.info("workflow.start prompt_length=%s", len(prompt))
+    agent_trace: list[dict[str, str]] = []
 
-        agent_trace: list[dict[str, str]] = []
+    orchestrator, duration = call_agent(
+        "orchestrator_agent",
+        "Orchestrator Agent",
+        "You are the Orchestrator Agent for a recipe shopping app. Decide whether the user prompt is recipe, meal-planning, grocery, ingredient, cooking, entertaining menu, or substitution related. Extract the user's cooking intent, likely servings, constraints, and requested meals. Do not create the shopping cart. Prepare structured context for specialist agents.",
+        prompt,
+        ORCHESTRATOR_SCHEMA,
+        [customer_context_lookup],
+    )
+    agent_trace.append(trace_event("context", "Orchestrator Agent", orchestrator["traceDetail"], duration))
 
-        try:
-            orchestrator, duration = call_agent(
-                "orchestrator_agent",
-                "Orchestrator Agent",
-                "You are the Orchestrator Agent for a recipe shopping app. Decide whether the user prompt is recipe, meal-planning, grocery, ingredient, cooking, entertaining menu, or substitution related. Extract the user's cooking intent, likely servings, constraints, and requested meals. Do not create the shopping cart. Prepare structured context for specialist agents.",
-                prompt,
-                ORCHESTRATOR_SCHEMA,
-            )
-            agent_trace.append(trace_event("context", "Orchestrator Agent", orchestrator["traceDetail"], duration))
+    if not orchestrator["isRecipeRelated"]:
+        return non_recipe_plan(orchestrator)
 
-            if not orchestrator["isRecipeRelated"]:
-                span.set_attribute("recipe.related", False)
-                result = non_recipe_plan(orchestrator)
-                if genai_workflow is not None:
-                    set_eval_fields(genai_workflow, actual_output=result)
-                    genai_workflow.output_messages = [output_message(result)]
-                    genai_workflow.final_output = clipped_text(result)
-                return result
+    recipe_plan, duration = call_agent(
+        "recipe_planner_agent",
+        "Recipe Planner Agent",
+        "You are the Recipe Planner Agent. Choose practical recipes or meal components that satisfy the orchestrator context. Return base ingredients with quantities and reasons. Include sides, garnishes, dessert, and substitutions when relevant. Do not group by supermarket aisle; a later agent owns catalog mapping and cart grouping.",
+        {"userPrompt": prompt, "orchestrator": orchestrator},
+        RECIPE_PLANNER_SCHEMA,
+        [recipe_search],
+    )
+    agent_trace.append(trace_event("recipe", "Recipe Planner Agent", recipe_plan["traceDetail"], duration))
 
-            recipe_plan, duration = call_agent(
-                "recipe_planner_agent",
-                "Recipe Planner Agent",
-                "You are the Recipe Planner Agent. Choose practical recipes or meal components that satisfy the orchestrator context. Return base ingredients with quantities and reasons. Include sides, garnishes, dessert, and substitutions when relevant. Do not group by supermarket aisle; a later agent owns catalog mapping and cart grouping.",
-                {"userPrompt": prompt, "orchestrator": orchestrator},
-                RECIPE_PLANNER_SCHEMA,
-            )
-            agent_trace.append(trace_event("recipe", "Recipe Planner Agent", recipe_plan["traceDetail"], duration))
+    product_cart, duration = call_agent(
+        "product_search_agent",
+        "Product Search Agent",
+        "You are the Product Search Agent. Map the recipe planner's ingredients into supermarket-style grocery products. Normalize duplicate ingredients, use customer-friendly product names, and group them by common supermarket aisle. Keep quantities practical for the stated servings.",
+        {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan},
+        GROUPED_CART_SCHEMA,
+        [product_catalog_search],
+    )
+    agent_trace.append(trace_event("product", "Product Search Agent", product_cart["traceDetail"], duration))
 
-            product_cart, duration = call_agent(
-                "product_search_agent",
-                "Product Search Agent",
-                "You are the Product Search Agent. Map the recipe planner's ingredients into supermarket-style grocery products. Normalize duplicate ingredients, use customer-friendly product names, and group them by common supermarket aisle. Keep quantities practical for the stated servings.",
-                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan},
-                GROUPED_CART_SCHEMA,
-            )
-            agent_trace.append(trace_event("product", "Product Search Agent", product_cart["traceDetail"], duration))
+    inventory_review, duration = call_agent(
+        "inventory_availability_agent",
+        "Inventory & Availability Agent",
+        "You are the Inventory & Availability Agent. Review the grouped cart for likely stock, freshness, and substitution issues. Keep the cart grouped by aisle, preserve useful items, and add clear substitution notes. Do not claim live inventory access; describe reasonable availability assumptions.",
+        {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "productCart": product_cart},
+        REVIEW_AGENT_SCHEMA,
+        [store_inventory_check],
+    )
+    agent_trace.append(trace_event("inventory", "Inventory & Availability Agent", inventory_review["traceDetail"], duration))
 
-            inventory_review, duration = call_agent(
-                "inventory_availability_agent",
-                "Inventory & Availability Agent",
-                "You are the Inventory & Availability Agent. Review the grouped cart for likely stock, freshness, and substitution issues. Keep the cart grouped by aisle, preserve useful items, and add clear substitution notes. Do not claim live inventory access; describe reasonable availability assumptions.",
-                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "productCart": product_cart},
-                REVIEW_AGENT_SCHEMA,
-            )
-            agent_trace.append(trace_event("inventory", "Inventory & Availability Agent", inventory_review["traceDetail"], duration))
+    promotion_review, duration = call_agent(
+        "loyalty_promotions_agent",
+        "Loyalty & Promotions Agent",
+        "You are the Loyalty & Promotions Agent. Review the cart for sensible savings, bulk-buy, pantry-staple, and optional add-on opportunities. Keep the grouped cart intact unless a small practical adjustment improves the customer experience. Add concise customer notes and optional items. Do not invent exact coupons or live prices.",
+        {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "inventoryReview": inventory_review},
+        REVIEW_AGENT_SCHEMA,
+        [promotions_search],
+    )
+    agent_trace.append(trace_event("promotions", "Loyalty & Promotions Agent", promotion_review["traceDetail"], duration))
 
-            promotion_review, duration = call_agent(
-                "loyalty_promotions_agent",
-                "Loyalty & Promotions Agent",
-                "You are the Loyalty & Promotions Agent. Review the cart for sensible savings, bulk-buy, pantry-staple, and optional add-on opportunities. Keep the grouped cart intact unless a small practical adjustment improves the customer experience. Add concise customer notes and optional items. Do not invent exact coupons or live prices.",
-                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "inventoryReview": inventory_review},
-                REVIEW_AGENT_SCHEMA,
-            )
-            agent_trace.append(trace_event("promotions", "Loyalty & Promotions Agent", promotion_review["traceDetail"], duration))
+    built_cart, duration = call_agent(
+        "shopping_list_builder_agent",
+        "Shopping List Builder Agent",
+        "You are the Shopping List Builder Agent. Finalize the cart for a customer-facing grocery app. Deduplicate items, keep aisle grouping tidy, and ensure each product has a clear quantity and shopping reason. Preserve substitution, optional item, and note guidance from upstream agents.",
+        {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "promotionReview": promotion_review},
+        REVIEW_AGENT_SCHEMA,
+    )
+    agent_trace.append(trace_event("builder", "Shopping List Builder Agent", built_cart["traceDetail"], duration))
 
-            built_cart, duration = call_agent(
-                "shopping_list_builder_agent",
-                "Shopping List Builder Agent",
-                "You are the Shopping List Builder Agent. Finalize the cart for a customer-facing grocery app. Deduplicate items, keep aisle grouping tidy, and ensure each product has a clear quantity and shopping reason. Preserve substitution, optional item, and note guidance from upstream agents.",
-                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "promotionReview": promotion_review},
-                REVIEW_AGENT_SCHEMA,
-            )
-            agent_trace.append(trace_event("builder", "Shopping List Builder Agent", built_cart["traceDetail"], duration))
+    final_response, duration = call_agent(
+        "final_response_agent",
+        "Final Response Agent",
+        "You are the Final Response Agent for MarketMate. Write a concise customer-facing summary and helpful notes for the completed cart. Do not change the cart. Explain the plan in polished shopping-app language.",
+        {"userPrompt": prompt, "orchestrator": orchestrator, "builtCart": built_cart},
+        FINAL_AGENT_SCHEMA,
+    )
+    agent_trace.append(trace_event("final-response", "Final Response Agent", final_response["traceDetail"], duration))
 
-            final_response, duration = call_agent(
-                "final_response_agent",
-                "Final Response Agent",
-                "You are the Final Response Agent for MarketMate. Write a concise customer-facing summary and helpful notes for the completed cart. Do not change the cart. Explain the plan in polished shopping-app language.",
-                {"userPrompt": prompt, "orchestrator": orchestrator, "builtCart": built_cart},
-                FINAL_AGENT_SCHEMA,
-            )
-            agent_trace.append(trace_event("final-response", "Final Response Agent", final_response["traceDetail"], duration))
-
-            item_count = sum(len(group["items"]) for group in built_cart["groups"])
-            span.set_attribute("recipe.related", True)
-            span.set_attribute("cart.item_count", item_count)
-            span.set_attribute("cart.group_count", len(built_cart["groups"]))
-
-            result = {
-                "isRecipeRelated": True,
-                "summary": final_response["summary"],
-                "agentTrace": agent_trace,
-                "groups": built_cart["groups"],
-                "substitutions": built_cart["substitutions"],
-                "optionalItems": built_cart["optionalItems"],
-                "customerNotes": (built_cart["customerNotes"] + final_response["customerNotes"])[:8],
-            }
-            if genai_workflow is not None:
-                set_eval_fields(genai_workflow, actual_output=result)
-                genai_workflow.output_messages = [output_message(result)]
-                genai_workflow.final_output = clipped_text(result)
-            app_logger.info(
-                "workflow.complete recipe_related=true cart_item_count=%s cart_group_count=%s",
-                item_count,
-                len(built_cart["groups"]),
-            )
-            return result
-        finally:
-            if GENAI_ENABLED and genai_handler and genai_workflow is not None:
-                genai_handler.stop_workflow(genai_workflow)
-            CURRENT_WORKFLOW_RUN_ID = previous_workflow_run_id
+    item_count = sum(len(group["items"]) for group in built_cart["groups"])
+    result = {
+        "isRecipeRelated": True,
+        "summary": final_response["summary"],
+        "agentTrace": agent_trace,
+        "groups": built_cart["groups"],
+        "substitutions": built_cart["substitutions"],
+        "optionalItems": built_cart["optionalItems"],
+        "customerNotes": (built_cart["customerNotes"] + final_response["customerNotes"])[:8],
+    }
+    app_logger.info(
+        "workflow.complete recipe_related=true cart_item_count=%s cart_group_count=%s",
+        item_count,
+        len(built_cart["groups"]),
+    )
+    return result
 
 
 class MarketMateHandler(BaseHTTPRequestHandler):
@@ -612,77 +438,66 @@ class MarketMateHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         request_started_at = time.monotonic()
-        with tracer.start_as_current_span("http.post.recipe_plan") as span:
-            span.set_attribute("http.request.method", "POST")
-            span.set_attribute("url.path", self.path)
-
-            try:
-                if self.path != "/api/recipe-plan":
-                    self.send_error(404)
-                    return
-
-                length = int(self.headers.get("content-length", "0"))
-                if length > 50_000:
-                    raise AppError("Request body is too large.", 413)
-
-                body = self.rfile.read(length).decode("utf-8")
-                payload = json.loads(body or "{}")
-                prompt = payload.get("prompt", "")
-
-                if not isinstance(prompt, str) or len(prompt.strip()) < 3:
-                    raise AppError("Please enter a recipe or meal-planning prompt.", 400)
-
-                result = create_shopping_plan(prompt.strip())
-                self.send_json(200, result)
-                app_logger.info(
-                    "http.request method=POST path=%s status=200 duration_ms=%s",
-                    self.path,
-                    int((time.monotonic() - request_started_at) * 1000),
-                )
-            except AppError as error:
-                span.record_exception(error)
-                span.set_status(Status(StatusCode.ERROR))
-                self.send_json(error.status, {"error": str(error)})
-                app_logger.warning(
-                    "http.request method=POST path=%s status=%s error=%s",
-                    self.path,
-                    error.status,
-                    error,
-                )
-            except Exception as error:
-                span.record_exception(error)
-                span.set_status(Status(StatusCode.ERROR))
-                self.send_json(500, {"error": str(error) or "Unexpected server error."})
-                app_logger.exception("http.request method=POST path=%s status=500", self.path)
-
-    def do_GET(self) -> None:
-        request_started_at = time.monotonic()
-        with tracer.start_as_current_span("http.get.static") as span:
-            span.set_attribute("http.request.method", "GET")
-            span.set_attribute("url.path", self.path)
-            parsed = urllib.parse.urlparse(self.path)
-            relative = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
-            file_path = (STATIC_ROOT / urllib.parse.unquote(relative)).resolve()
-
-            if not str(file_path).startswith(str(STATIC_ROOT.resolve())):
-                self.send_error(403)
-                return
-
-            if not file_path.exists() or not file_path.is_file():
+        try:
+            if self.path != "/api/recipe-plan":
                 self.send_error(404)
                 return
 
-            content = file_path.read_bytes()
-            self.send_response(200)
-            self.send_header("content-type", self.guess_type(file_path))
-            self.send_header("content-length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
+            length = int(self.headers.get("content-length", "0"))
+            if length > 50_000:
+                raise AppError("Request body is too large.", 413)
+
+            body = self.rfile.read(length).decode("utf-8")
+            payload = json.loads(body or "{}")
+            prompt = payload.get("prompt", "")
+
+            if not isinstance(prompt, str) or len(prompt.strip()) < 3:
+                raise AppError("Please enter a recipe or meal-planning prompt.", 400)
+
+            result = create_shopping_plan(prompt.strip())
+            self.send_json(200, result)
             app_logger.info(
-                "http.request method=GET path=%s status=200 duration_ms=%s",
+                "http.request method=POST path=%s status=200 duration_ms=%s",
                 self.path,
                 int((time.monotonic() - request_started_at) * 1000),
             )
+        except AppError as error:
+            self.send_json(error.status, {"error": str(error)})
+            app_logger.warning(
+                "http.request method=POST path=%s status=%s error=%s",
+                self.path,
+                error.status,
+                error,
+            )
+        except Exception as error:
+            self.send_json(500, {"error": str(error) or "Unexpected server error."})
+            app_logger.exception("http.request method=POST path=%s status=500", self.path)
+
+    def do_GET(self) -> None:
+        request_started_at = time.monotonic()
+        parsed = urllib.parse.urlparse(self.path)
+        relative = "index.html" if parsed.path == "/" else parsed.path.lstrip("/")
+        file_path = (STATIC_ROOT / urllib.parse.unquote(relative)).resolve()
+
+        if not str(file_path).startswith(str(STATIC_ROOT.resolve())):
+            self.send_error(403)
+            return
+
+        if not file_path.exists() or not file_path.is_file():
+            self.send_error(404)
+            return
+
+        content = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("content-type", self.guess_type(file_path))
+        self.send_header("content-length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+        app_logger.info(
+            "http.request method=GET path=%s status=200 duration_ms=%s",
+            self.path,
+            int((time.monotonic() - request_started_at) * 1000),
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         app_logger.info("http.server client=%s message=%s", self.client_address[0], format % args)
@@ -707,8 +522,7 @@ class MarketMateHandler(BaseHTTPRequestHandler):
 def main() -> None:
     app_logger.info("MarketMate Python running at http://%s:%s", HOST, PORT)
     app_logger.info("LLM model: %s", MODEL)
-    app_logger.info("OpenTelemetry: %s", "enabled" if OTEL_ENABLED else "not installed; install requirements.txt to enable")
-    app_logger.info("Splunk GenAI telemetry: %s", "enabled" if GENAI_ENABLED else "not installed; install requirements.txt to enable")
+    app_logger.info("OpenAI Agents SDK: %s", "enabled" if AGENTS_SDK_ENABLED else "not installed; install requirements.txt to enable")
     ThreadingHTTPServer((HOST, PORT), MarketMateHandler).serve_forever()
 
 

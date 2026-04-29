@@ -1,6 +1,6 @@
-opentelemetry-api>=1.38.0
-opentelemetry-sdk>=1.38.0
+openai-agents>=0.3.3
+opentelemetry-distro>=0.59b0
 opentelemetry-exporter-otlp>=1.38.0
-splunk-otel-util-genai
+splunk-otel-instrumentation-openai-agents
 splunk-otel-genai-emitters-splunk
 splunk-otel-genai-evals-deepeval

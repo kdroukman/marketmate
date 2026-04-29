@@ -1,6 +1,6 @@
-# MarketMate Python + OpenTelemetry
+# MarketMate Python + OpenAI Agents SDK
 
-This is a Python version of the MarketMate multi-agent recipe shopping app. It keeps the same browser UI, but the backend is Python and each AI agent call is traced with OpenTelemetry and Splunk AI Agent Monitoring GenAI telemetry.
+This is a Python version of the MarketMate multi-agent recipe shopping app. It keeps the same browser UI, but the backend uses the OpenAI Agents SDK for the demo workflow.
 
 ## Run
 
@@ -18,44 +18,23 @@ Open the app at:
 http://localhost:5273
 ```
 
-## Tracing
+## Splunk AI Agent Monitoring
 
-By default, spans are printed to the console. To export to a local Splunk OpenTelemetry Collector:
+The app is designed to run with Splunk's zero-code instrumentation for OpenAI Agents SDK apps. Run it with `opentelemetry-instrument` so the instrumentation package can capture agents, LLM calls, tool calls, tokens, metrics, traces, logs, and evaluation events:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
 OTEL_SERVICE_NAME=marketmate-python \
 OPENAI_API_KEY=your_key \
-python app.py
+/path/to/.venv/bin/opentelemetry-instrument python app.py
 ```
 
-Important spans:
+Key packages:
 
-- `http.post.recipe_plan`
-- `agent.orchestrator_agent`
-- `agent.recipe_planner_agent`
-- `agent.product_search_agent`
-- `agent.inventory_availability_agent`
-- `agent.loyalty_promotions_agent`
-- `agent.shopping_list_builder_agent`
-- `agent.final_response_agent`
-- `cart.response`
-
-## Splunk AI Agent Monitoring
-
-The app uses Splunk's code-based GenAI instrumentation package:
-
-```text
-splunk-otel-util-genai
-splunk-otel-genai-emitters-splunk
-splunk-otel-genai-evals-deepeval
-```
-
-It emits:
-
-- `Workflow`: `marketmate_recipe_shopping_workflow`
-- `AgentInvocation`: one for each MarketMate specialist agent
-- `LLMInvocation`: one for each OpenAI Responses API call
+- `openai-agents`
+- `splunk-otel-instrumentation-openai-agents`
+- `splunk-otel-genai-emitters-splunk`
+- `splunk-otel-genai-evals-deepeval`
 
 The EC2 CloudFormation template installs the Splunk Distribution of the OpenTelemetry Collector and sets:
 
@@ -71,6 +50,8 @@ OTEL_INSTRUMENTATION_GENAI_EMITTERS_EVALUATION=replace-category:SplunkEvaluation
 OTEL_INSTRUMENTATION_GENAI_EVALS_SEPARATE_PROCESS=false
 DEEPEVAL_FILE_SYSTEM=READ_ONLY
 ```
+
+The app's workflow uses OpenAI Agents SDK `Agent` and `Runner` calls, and function tools for customer context, recipe search, product catalog search, inventory review, and promotions. The application code no longer creates Splunk GenAI telemetry objects directly.
 
 Splunk Observability telemetry and Splunk Cloud evaluation events use separate tokens:
 
