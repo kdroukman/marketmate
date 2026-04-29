@@ -12,13 +12,16 @@ This template is designed to be free-tier eligible, not guaranteed free:
 - No Elastic IP is created.
 - The instance uses Amazon Linux 2023 via AWS's public SSM AMI parameter.
 - SSH is not opened; use AWS Systems Manager Session Manager if you need shell access.
+- SSH is opened only to the `SshIngressCidr` parameter and requires an existing EC2 key pair.
 - The app port defaults to `5273`.
 - The Splunk Distribution of OpenTelemetry Collector is installed using Splunk's Linux installer script.
 - The app exports OTLP traces to the local collector at `http://127.0.0.1:4318/v1/traces`.
 - The app and collector set `deployment.environment=marketmate` by default.
 - The app includes Splunk AI Agent Monitoring code-based GenAI instrumentation via `splunk-otel-util-genai`.
 - The app venv uses Python 3.11 because Splunk AI Agent Monitoring requires Python 3.10+ and Amazon Linux 2023's system Python is 3.9.
-- Splunk and OpenAI secrets are read from encrypted SSM SecureString parameters at boot.
+- Splunk Observability, Splunk Cloud HEC, and OpenAI secrets are read from encrypted SSM SecureString parameters at boot.
+- Observability telemetry uses the Splunk Observability access token and realm `us1`.
+- GenAI evaluation/log events use the separate Splunk Cloud Platform HEC token and HEC endpoint through the collector `splunk_hec` exporter/logs pipeline.
 
 Before creating the stack, confirm your EC2 Free Tier eligibility in AWS Billing/EC2. AWS’s current docs say Free Tier details differ based on whether the account was created before or after July 15, 2025. AWS also charges public IPv4 addresses, though EC2 Free Tier includes 750 public IPv4 hours/month for eligible accounts during the Free Tier period.
 
@@ -37,8 +40,12 @@ aws cloudformation create-stack \
     ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
     ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
     ParameterKey=AppIngressCidr,ParameterValue=YOUR_IP/32 \
+    ParameterKey=SshIngressCidr,ParameterValue=YOUR_IP/32 \
+    ParameterKey=KeyName,ParameterValue=YOUR_KEY_PAIR_NAME \
     ParameterKey=SplunkAccessTokenParameterName,ParameterValue=/marketmate/splunk/access-token \
     ParameterKey=OpenAIApiKeyParameterName,ParameterValue=/marketmate/openai/api-key \
+    ParameterKey=SplunkHecTokenParameterName,ParameterValue=/marketmate/splunk/hec-token \
+    ParameterKey=SplunkHecEndpoint,ParameterValue=https://shw-playground.splunkcloud.com/services/collector \
     ParameterKey=SplunkRealm,ParameterValue=us1 \
     ParameterKey=EnvironmentName,ParameterValue=marketmate
 ```
@@ -68,7 +75,22 @@ aws ssm put-parameter \
   --type SecureString \
   --value YOUR_OPENAI_API_KEY \
   --overwrite
+
+aws ssm put-parameter \
+  --name /marketmate/splunk/hec-token \
+  --type SecureString \
+  --value YOUR_SPLUNK_CLOUD_HEC_TOKEN \
+  --overwrite
 ```
+
+The EC2 bootstrap passes the HEC settings to the Splunk OTel Collector installer:
+
+```bash
+--hec-token "$SPLUNK_HEC_TOKEN"
+--hec-url "https://shw-playground.splunkcloud.com/services/collector"
+```
+
+It also writes `SPLUNK_HEC_TOKEN` and `SPLUNK_HEC_URL` into `/etc/otel/collector/splunk-otel-collector.conf`. The default Linux agent configuration includes the `splunk_hec` exporter in the logs pipeline, which is the path Splunk uses for instrumentation-side GenAI evaluation events.
 
 ## Update App Code
 

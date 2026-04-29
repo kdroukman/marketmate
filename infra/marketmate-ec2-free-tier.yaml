@@ -37,6 +37,15 @@ Parameters:
       - t3.micro
     Description: t2.micro/t3.micro are commonly Free Tier eligible for older accounts; verify eligibility in your region/account.
 
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair name for SSH access.
+
+  SshIngressCidr:
+    Type: String
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2})$"
+    Description: CIDR allowed to SSH into the instance. Use your-ip/32.
+
   RootVolumeSizeGb:
     Type: Number
     Default: 8
@@ -71,6 +80,16 @@ Parameters:
     Type: String
     Default: /marketmate/openai/api-key
     Description: Name of the encrypted SSM SecureString parameter containing the OpenAI API key.
+
+  SplunkHecTokenParameterName:
+    Type: String
+    Default: /marketmate/splunk/hec-token
+    Description: Name of the encrypted SSM SecureString parameter containing the Splunk Cloud Platform HEC token for GenAI evaluation events.
+
+  SplunkHecEndpoint:
+    Type: String
+    Default: https://shw-playground.splunkcloud.com/services/collector
+    Description: Splunk Cloud Platform HEC endpoint used for GenAI evaluation logs/events.
 
   SplunkRealm:
     Type: String
@@ -114,6 +133,7 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SplunkAccessTokenParameterName}"
                   - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${OpenAIApiKeyParameterName}"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SplunkHecTokenParameterName}"
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -130,6 +150,11 @@ Resources:
       GroupDescription: !Sub "Allow inbound MarketMate app traffic on ${AppPort}"
       VpcId: !Ref VpcId
       SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshIngressCidr
+          Description: SSH access
         - IpProtocol: tcp
           FromPort: !Ref AppPort
           ToPort: !Ref AppPort
@@ -150,6 +175,7 @@ Resources:
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
       CreditSpecification:
         CPUCredits: standard
       IamInstanceProfile: !Ref InstanceProfile
@@ -185,13 +211,25 @@ Resources:
 
           SPLUNK_ACCESS_TOKEN=$(aws ssm get-parameter --name "${SplunkAccessTokenParameterName}" --with-decryption --query Parameter.Value --output text --region ${AWS::Region})
           OPENAI_API_KEY=$(aws ssm get-parameter --name "${OpenAIApiKeyParameterName}" --with-decryption --query Parameter.Value --output text --region ${AWS::Region})
+          SPLUNK_HEC_TOKEN=$(aws ssm get-parameter --name "${SplunkHecTokenParameterName}" --with-decryption --query Parameter.Value --output text --region ${AWS::Region})
 
           curl -sSL https://dl.observability.splunkcloud.com/splunk-otel-collector.sh > /tmp/splunk-otel-collector.sh
           sh /tmp/splunk-otel-collector.sh \
             --realm ${SplunkRealm} \
+            --hec-token "$SPLUNK_HEC_TOKEN" \
+            --hec-url "${SplunkHecEndpoint}" \
             --memory ${SplunkOtelMemoryMiB} \
             --deployment-environment ${EnvironmentName} \
             -- "$SPLUNK_ACCESS_TOKEN"
+
+          cat >>/etc/otel/collector/splunk-otel-collector.conf <<COLLECTORENV
+          SPLUNK_HEC_TOKEN=$SPLUNK_HEC_TOKEN
+          SPLUNK_HEC_URL=${SplunkHecEndpoint}
+          COLLECTORENV
+
+          grep -q "splunk_hec:" /etc/otel/collector/agent_config.yaml
+          grep -q "pipelines:" /etc/otel/collector/agent_config.yaml
+          systemctl restart splunk-otel-collector
 
           id -u $APP_USER >/dev/null 2>&1 || useradd --system --home-dir $APP_HOME --shell /sbin/nologin $APP_USER
           mkdir -p $APP_HOME
@@ -225,6 +263,15 @@ Resources:
           Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
           Environment=OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
           Environment=OTEL_RESOURCE_ATTRIBUTES=deployment.environment=${EnvironmentName}
+          Environment=OTEL_INSTRUMENTATION_GENAI_EMITTERS=span_metric_event,splunk
+          Environment=OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
+          Environment=OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT_MODE=SPAN_AND_EVENT
+          Environment=OTEL_INSTRUMENTATION_GENAI_EVALS_RESULTS_AGGREGATION=true
+          Environment=OTEL_INSTRUMENTATION_GENAI_EMITTERS_EVALUATION=replace-category:SplunkEvaluationResults
+          Environment=OTEL_INSTRUMENTATION_GENAI_EVALS_SEPARATE_PROCESS=true
+          Environment=OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
+          Environment=OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta
+          Environment=DEEPEVAL_TELEMETRY_OPT_OUT=YES
           EnvironmentFile=-/etc/marketmate/marketmate.env
           ExecStart=/opt/marketmate/repo/${AppSubdirectory}/.venv/bin/python app.py
           Restart=always

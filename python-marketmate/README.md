@@ -47,6 +47,8 @@ The app uses Splunk's code-based GenAI instrumentation package:
 
 ```text
 splunk-otel-util-genai
+splunk-otel-genai-emitters-splunk
+splunk-otel-genai-evals-deepeval
 ```
 
 It emits:
@@ -61,4 +63,15 @@ The EC2 CloudFormation template installs the Splunk Distribution of the OpenTele
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_RESOURCE_ATTRIBUTES=deployment.environment=marketmate
+OTEL_INSTRUMENTATION_GENAI_EMITTERS=span_metric_event,splunk
+OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
+OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT_MODE=SPAN_AND_EVENT
+OTEL_INSTRUMENTATION_GENAI_EVALS_RESULTS_AGGREGATION=true
+OTEL_INSTRUMENTATION_GENAI_EMITTERS_EVALUATION=replace-category:SplunkEvaluationResults
+OTEL_INSTRUMENTATION_GENAI_EVALS_SEPARATE_PROCESS=true
 ```
+
+Splunk Observability telemetry and Splunk Cloud evaluation events use separate tokens:
+
+- Splunk Observability Cloud: access token + realm `us1`
+- Splunk Cloud Platform evals/logs: HEC token + HEC endpoint
