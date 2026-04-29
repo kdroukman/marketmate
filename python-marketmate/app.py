@@ -326,6 +326,13 @@ def genai_input_message(role: str, content: Any) -> Any:
     return InputMessage(role=role, parts=[Text(content=clipped_text(content))])
 
 
+def set_eval_fields(invocation: Any, *, input_text: str | None = None, actual_output: Any | None = None) -> None:
+    if input_text is not None:
+        invocation.input = clipped_text(input_text)
+    if actual_output is not None:
+        invocation.actual_output = clipped_text(actual_output)
+
+
 def call_agent(name: str, title: str, instructions: str, input_data: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
     started_at = time.monotonic()
     app_logger.info("agent.start name=%s title=%s model=%s", name, title, MODEL)
@@ -373,6 +380,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             genai_agent.run_id = agent_run_id
             if CURRENT_WORKFLOW_RUN_ID:
                 genai_agent.parent_run_id = CURRENT_WORKFLOW_RUN_ID
+            set_eval_fields(genai_agent, input_text=input_text)
             genai_handler.start_agent(genai_agent)
 
             genai_llm = LLMInvocation(
@@ -384,6 +392,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             genai_llm.parent_run_id = agent_run_id
             genai_llm.provider = "openai"
             genai_llm.framework = "native-http"
+            set_eval_fields(genai_llm, input_text=input_text)
             genai_handler.start_llm(genai_llm)
 
         try:
@@ -398,6 +407,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             span.set_attribute("agent.trace_detail", parsed.get("traceDetail", ""))
 
             if genai_llm is not None:
+                set_eval_fields(genai_llm, actual_output=text)
                 genai_llm.output_messages = [
                     OutputMessage(
                         role="assistant",
@@ -406,6 +416,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
                     )
                 ]
             if genai_agent is not None:
+                set_eval_fields(genai_agent, actual_output=parsed)
                 genai_agent.output_result = clipped_text(parsed)
 
             app_logger.info("agent.complete name=%s title=%s duration_ms=%s", name, title, elapsed_ms)
@@ -470,6 +481,7 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
                 input_messages=[genai_input_message("user", prompt)],
             )
             genai_workflow.run_id = CURRENT_WORKFLOW_RUN_ID
+            set_eval_fields(genai_workflow, input_text=prompt)
             genai_handler.start_workflow(genai_workflow)
 
         agent_trace: list[dict[str, str]] = []
@@ -560,6 +572,7 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
                 "customerNotes": (built_cart["customerNotes"] + final_response["customerNotes"])[:8],
             }
             if genai_workflow is not None:
+                set_eval_fields(genai_workflow, actual_output=result)
                 genai_workflow.final_output = clipped_text(result)
             app_logger.info(
                 "workflow.complete recipe_related=true cart_item_count=%s cart_group_count=%s",
