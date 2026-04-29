@@ -30,6 +30,10 @@ const progressFill = document.querySelector("#progressFill");
 
 let running = false;
 let tracePosition = 0;
+const intakeStepDelayMs = 1200;
+const agentStepDelayMs = 2200;
+const approvalStepDelayMs = 1400;
+const checkoutStepDelayMs = 1600;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -159,7 +163,7 @@ async function runWorkflow() {
     activateStep(stepId);
     addTrace(stepId, title, detail, true);
     setProgress(tracePosition, workflow.length);
-    await sleep(260);
+    await sleep(intakeStepDelayMs);
   }
 
   try {
@@ -172,13 +176,14 @@ async function runWorkflow() {
       activateStep(stepId);
       addTrace(stepId, title, detail, true);
       setProgress(tracePosition, totalSteps);
-      await sleep(120);
+      await sleep(agentStepDelayMs);
     }
 
     tracePosition += 1;
     activateStep("approval");
     addTrace("approval", "Customer Approval", plan.isRecipeRelated ? "Agent-generated shopping cart is ready for review." : "Prompt was not recipe-related.", true);
     setProgress(tracePosition, totalSteps);
+    await sleep(approvalStepDelayMs);
 
     if (!plan.isRecipeRelated) {
       showError(plan.summary || "Please enter a prompt related to recipes, meals, groceries, or ingredients.");
@@ -218,7 +223,7 @@ async function approveList() {
     activateStep(stepId);
     addTrace(stepId, title, detail, true);
     setProgress(tracePosition, total);
-    await sleep(300);
+    await sleep(checkoutStepDelayMs);
   }
 
   addTrace("complete", "Order Confirmed", "Checkout, delivery scheduling, and notification workflow completed.", true);

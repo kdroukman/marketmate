@@ -88,7 +88,7 @@ Parameters:
 
   SplunkHecEndpoint:
     Type: String
-    Default: https://shw-playground.splunkcloud.com/services/collector
+    Default: https://http-inputs-shw-playground.splunkcloud.com/services/collector
     Description: Splunk Cloud Platform HEC endpoint used for GenAI evaluation logs/events.
 
   SplunkRealm:

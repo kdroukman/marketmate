@@ -15,7 +15,7 @@ This template is designed to be free-tier eligible, not guaranteed free:
 - SSH is opened only to the `SshIngressCidr` parameter and requires an existing EC2 key pair.
 - The app port defaults to `5273`.
 - The Splunk Distribution of OpenTelemetry Collector is installed using Splunk's Linux installer script.
-- The app exports OTLP traces to the local collector at `http://127.0.0.1:4318/v1/traces`.
+- The app exports OTLP to the local collector at `http://127.0.0.1:4318`. The Python OTLP HTTP exporter appends signal paths such as `/v1/traces`.
 - The app and collector set `deployment.environment=marketmate` by default.
 - The app includes Splunk AI Agent Monitoring code-based GenAI instrumentation via `splunk-otel-util-genai`.
 - The app venv uses Python 3.11 because Splunk AI Agent Monitoring requires Python 3.10+ and Amazon Linux 2023's system Python is 3.9.
@@ -45,7 +45,7 @@ aws cloudformation create-stack \
     ParameterKey=SplunkAccessTokenParameterName,ParameterValue=/marketmate/splunk/access-token \
     ParameterKey=OpenAIApiKeyParameterName,ParameterValue=/marketmate/openai/api-key \
     ParameterKey=SplunkHecTokenParameterName,ParameterValue=/marketmate/splunk/hec-token \
-    ParameterKey=SplunkHecEndpoint,ParameterValue=https://shw-playground.splunkcloud.com/services/collector \
+    ParameterKey=SplunkHecEndpoint,ParameterValue=https://http-inputs-shw-playground.splunkcloud.com/services/collector \
     ParameterKey=SplunkRealm,ParameterValue=us1 \
     ParameterKey=EnvironmentName,ParameterValue=marketmate
 ```
@@ -87,7 +87,7 @@ The EC2 bootstrap passes the HEC settings to the Splunk OTel Collector installer
 
 ```bash
 --hec-token "$SPLUNK_HEC_TOKEN"
---hec-url "https://shw-playground.splunkcloud.com/services/collector"
+--hec-url "https://http-inputs-shw-playground.splunkcloud.com/services/collector"
 ```
 
 It also writes `SPLUNK_HEC_TOKEN` and `SPLUNK_HEC_URL` into `/etc/otel/collector/splunk-otel-collector.conf`. The default Linux agent configuration includes the `splunk_hec` exporter in the logs pipeline, which is the path Splunk uses for instrumentation-side GenAI evaluation events.

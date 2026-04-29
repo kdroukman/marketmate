@@ -309,7 +309,7 @@ def post_to_openai(request_body: str, api_key: str) -> dict[str, Any]:
                 raise AppError(payload.get("error", {}).get("message", "The LLM request failed."), error.code)
             except json.JSONDecodeError as json_error:
                 raise AppError(body or "The LLM request failed.", error.code) from json_error
-        except (urllib.error.URLError, ssl.SSLError) as error:
+        except (TimeoutError, urllib.error.URLError, ssl.SSLError) as error:
             span.record_exception(error)
             span.set_attribute("openai.transport_fallback", "curl")
             return run_curl_request(request_body, api_key)
@@ -356,6 +356,7 @@ def output_message(content: Any) -> Any:
 def call_agent(name: str, title: str, instructions: str, input_data: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
     started_at = time.monotonic()
     app_logger.info("agent.start name=%s title=%s model=%s", name, title, MODEL)
+    evaluate_agent_output = name == "final_response_agent"
 
     with tracer.start_as_current_span(f"agent.{name}") as span:
         span.set_attribute("agent.name", title)
@@ -400,6 +401,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             genai_agent.run_id = agent_run_id
             if CURRENT_WORKFLOW_RUN_ID:
                 genai_agent.parent_run_id = CURRENT_WORKFLOW_RUN_ID
+            genai_agent.sample_for_evaluation = evaluate_agent_output
             set_eval_fields(genai_agent, input_text=input_text)
             genai_handler.start_agent(genai_agent)
 
@@ -412,6 +414,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             genai_llm.parent_run_id = agent_run_id
             genai_llm.provider = "openai"
             genai_llm.framework = "native-http"
+            genai_llm.sample_for_evaluation = False
             set_eval_fields(genai_llm, input_text=input_text)
             genai_handler.start_llm(genai_llm)
 
