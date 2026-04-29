@@ -327,10 +327,30 @@ def genai_input_message(role: str, content: Any) -> Any:
 
 
 def set_eval_fields(invocation: Any, *, input_text: str | None = None, actual_output: Any | None = None) -> None:
+    attributes = getattr(invocation, "attributes", None)
+    if attributes is None:
+        attributes = {}
+        invocation.attributes = attributes
     if input_text is not None:
-        invocation.input = clipped_text(input_text)
+        clipped_input = clipped_text(input_text)
+        invocation.input = clipped_input
+        attributes["input"] = clipped_input
+        attributes.setdefault("prompt_capture", {})["input"] = clipped_input
     if actual_output is not None:
-        invocation.actual_output = clipped_text(actual_output)
+        clipped_output = clipped_text(actual_output)
+        invocation.actual_output = clipped_output
+        attributes["actual_output"] = clipped_output
+        attributes["output"] = clipped_output
+        attributes["output_result"] = clipped_output
+        attributes.setdefault("prompt_capture", {})["output_result"] = clipped_output
+
+
+def output_message(content: Any) -> Any:
+    return OutputMessage(
+        role="assistant",
+        parts=[Text(content=clipped_text(content))],
+        finish_reason="stop",
+    )
 
 
 def call_agent(name: str, title: str, instructions: str, input_data: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
@@ -408,15 +428,10 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
 
             if genai_llm is not None:
                 set_eval_fields(genai_llm, actual_output=text)
-                genai_llm.output_messages = [
-                    OutputMessage(
-                        role="assistant",
-                        parts=[Text(content=clipped_text(text))],
-                        finish_reason="stop",
-                    )
-                ]
+                genai_llm.output_messages = [output_message(text)]
             if genai_agent is not None:
                 set_eval_fields(genai_agent, actual_output=parsed)
+                genai_agent.output_messages = [output_message(parsed)]
                 genai_agent.output_result = clipped_text(parsed)
 
             app_logger.info("agent.complete name=%s title=%s duration_ms=%s", name, title, elapsed_ms)
@@ -500,6 +515,8 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
                 span.set_attribute("recipe.related", False)
                 result = non_recipe_plan(orchestrator)
                 if genai_workflow is not None:
+                    set_eval_fields(genai_workflow, actual_output=result)
+                    genai_workflow.output_messages = [output_message(result)]
                     genai_workflow.final_output = clipped_text(result)
                 return result
 
@@ -573,6 +590,7 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
             }
             if genai_workflow is not None:
                 set_eval_fields(genai_workflow, actual_output=result)
+                genai_workflow.output_messages = [output_message(result)]
                 genai_workflow.final_output = clipped_text(result)
             app_logger.info(
                 "workflow.complete recipe_related=true cart_item_count=%s cart_group_count=%s",
