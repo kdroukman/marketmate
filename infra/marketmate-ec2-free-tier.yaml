@@ -62,6 +62,28 @@ Parameters:
     AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2})$"
     Description: CIDR allowed to reach the app port. Use your-ip/32 for a tighter demo.
 
+  SplunkAccessToken:
+    Type: String
+    NoEcho: true
+    Description: Splunk Observability Cloud access token used by the Splunk OTel Collector.
+
+  SplunkRealm:
+    Type: String
+    Default: us1
+    Description: Splunk Observability Cloud realm.
+
+  EnvironmentName:
+    Type: String
+    Default: marketmate
+    Description: Value for the OpenTelemetry deployment.environment resource attribute.
+
+  SplunkOtelMemoryMiB:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 768
+    Description: Memory limit passed to the Splunk OTel Collector installer.
+
 Resources:
   InstanceRole:
     Type: AWS::IAM::Role
@@ -143,7 +165,14 @@ Resources:
           APP_DIR=$REPO_DIR/${AppSubdirectory}
 
           dnf update -y
-          dnf install -y git python3 python3-pip
+          dnf install -y curl git python3 python3-pip sudo
+
+          curl -sSL https://dl.observability.splunkcloud.com/splunk-otel-collector.sh > /tmp/splunk-otel-collector.sh
+          sh /tmp/splunk-otel-collector.sh \
+            --realm ${SplunkRealm} \
+            --memory ${SplunkOtelMemoryMiB} \
+            --deployment-environment ${EnvironmentName} \
+            -- ${SplunkAccessToken}
 
           id -u $APP_USER >/dev/null 2>&1 || useradd --system --home-dir $APP_HOME --shell /sbin/nologin $APP_USER
           mkdir -p $APP_HOME
@@ -174,6 +203,9 @@ Resources:
           WorkingDirectory=/opt/marketmate/repo/${AppSubdirectory}
           Environment=PORT=${AppPort}
           Environment=OTEL_SERVICE_NAME=marketmate-ec2
+          Environment=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
+          Environment=OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+          Environment=OTEL_RESOURCE_ATTRIBUTES=deployment.environment=${EnvironmentName}
           EnvironmentFile=-/etc/marketmate/marketmate.env
           ExecStart=/opt/marketmate/repo/${AppSubdirectory}/.venv/bin/python app.py
           Restart=always

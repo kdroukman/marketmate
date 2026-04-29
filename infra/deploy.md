@@ -13,6 +13,9 @@ This template is designed to be free-tier eligible, not guaranteed free:
 - The instance uses Amazon Linux 2023 via AWS's public SSM AMI parameter.
 - SSH is not opened; use AWS Systems Manager Session Manager if you need shell access.
 - The app port defaults to `5273`.
+- The Splunk Distribution of OpenTelemetry Collector is installed using Splunk's Linux installer script.
+- The app exports OTLP traces to the local collector at `http://127.0.0.1:4318/v1/traces`.
+- The app and collector set `deployment.environment=marketmate` by default.
 
 Before creating the stack, confirm your EC2 Free Tier eligibility in AWS Billing/EC2. AWS’s current docs say Free Tier details differ based on whether the account was created before or after July 15, 2025. AWS also charges public IPv4 addresses, though EC2 Free Tier includes 750 public IPv4 hours/month for eligible accounts during the Free Tier period.
 
@@ -30,7 +33,10 @@ aws cloudformation create-stack \
     ParameterKey=GitBranch,ParameterValue=main \
     ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
     ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
-    ParameterKey=AppIngressCidr,ParameterValue=0.0.0.0/0
+    ParameterKey=AppIngressCidr,ParameterValue=YOUR_IP/32 \
+    ParameterKey=SplunkAccessToken,ParameterValue=YOUR_SPLUNK_ACCESS_TOKEN \
+    ParameterKey=SplunkRealm,ParameterValue=us1 \
+    ParameterKey=EnvironmentName,ParameterValue=marketmate
 ```
 
 Wait for completion:
