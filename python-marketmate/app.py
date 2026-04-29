@@ -74,6 +74,23 @@ except ModuleNotFoundError:
 
     tracer = _NoopTracer()
 
+try:
+    from opentelemetry.util.genai.handler import get_telemetry_handler
+    from opentelemetry.util.genai.types import (
+        AgentInvocation,
+        InputMessage,
+        LLMInvocation,
+        OutputMessage,
+        Text,
+        Workflow,
+    )
+
+    genai_handler = get_telemetry_handler()
+    GENAI_ENABLED = True
+except ModuleNotFoundError:
+    genai_handler = None
+    GENAI_ENABLED = False
+
 
 GROCERY_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -273,12 +290,26 @@ def post_to_openai(request_body: str, api_key: str) -> dict[str, Any]:
             return run_curl_request(request_body, api_key)
 
 
+def clipped_text(value: Any, limit: int = 10_000) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, indent=2)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... [truncated]"
+
+
+def genai_input_message(role: str, content: Any) -> Any:
+    return InputMessage(role=role, parts=[Text(content=clipped_text(content))])
+
+
 def call_agent(name: str, title: str, instructions: str, input_data: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
     started_at = time.monotonic()
 
     with tracer.start_as_current_span(f"agent.{name}") as span:
         span.set_attribute("agent.name", title)
         span.set_attribute("gen_ai.request.model", MODEL)
+        input_text = input_data if isinstance(input_data, str) else json.dumps(input_data, indent=2)
+        genai_agent = None
+        genai_llm = None
 
         request_body = json.dumps({
             "model": MODEL,
@@ -286,7 +317,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
                 {"role": "system", "content": [{"type": "input_text", "text": instructions}]},
                 {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": input_data if isinstance(input_data, str) else json.dumps(input_data, indent=2)}],
+                    "content": [{"type": "input_text", "text": input_text}],
                 },
             ],
             "text": {
@@ -299,16 +330,58 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             },
         })
 
-        payload = post_to_openai(request_body, os.environ["OPENAI_API_KEY"])
-        text = output_text(payload)
-        if not text:
-            raise AppError(f"{title} did not return parseable output text.")
+        if GENAI_ENABLED and genai_handler:
+            input_messages = [
+                genai_input_message("system", instructions),
+                genai_input_message("user", input_text),
+            ]
+            genai_agent = AgentInvocation(
+                name=title,
+                agent_type=name.replace("_agent", ""),
+                model=MODEL,
+                system_instructions=instructions,
+                input_messages=input_messages,
+            )
+            genai_handler.start_agent(genai_agent)
 
-        parsed = json.loads(text)
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-        span.set_attribute("agent.duration_ms", elapsed_ms)
-        span.set_attribute("agent.trace_detail", parsed.get("traceDetail", ""))
-        return parsed, elapsed_ms
+            genai_llm = LLMInvocation(
+                request_model=MODEL,
+                operation="responses",
+                input_messages=input_messages,
+            )
+            genai_llm.provider = "openai"
+            genai_llm.framework = "native-http"
+            genai_handler.start_llm(genai_llm)
+
+        try:
+            payload = post_to_openai(request_body, os.environ["OPENAI_API_KEY"])
+            text = output_text(payload)
+            if not text:
+                raise AppError(f"{title} did not return parseable output text.")
+
+            parsed = json.loads(text)
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            span.set_attribute("agent.duration_ms", elapsed_ms)
+            span.set_attribute("agent.trace_detail", parsed.get("traceDetail", ""))
+
+            if genai_llm is not None:
+                genai_llm.output_messages = [
+                    OutputMessage(
+                        role="assistant",
+                        parts=[Text(content=clipped_text(text))],
+                        finish_reason="stop",
+                    )
+                ]
+            if genai_agent is not None:
+                genai_agent.output_result = clipped_text(parsed)
+
+            return parsed, elapsed_ms
+        finally:
+            if GENAI_ENABLED and genai_handler:
+                if genai_llm is not None:
+                    genai_handler.stop_llm(genai_llm)
+                if genai_agent is not None:
+                    genai_handler.stop_agent(genai_agent)
 
 
 def trace_event(step_id: str, title: str, detail: str, duration_ms: int | None = None) -> dict[str, str]:
@@ -350,89 +423,108 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
 
     with tracer.start_as_current_span("cart.response") as span:
         span.set_attribute("recipe.prompt_length", len(prompt))
+        genai_workflow = None
+        if GENAI_ENABLED and genai_handler:
+            genai_workflow = Workflow(
+                name="marketmate_recipe_shopping_workflow",
+                workflow_type="multi_agent_recipe_cart",
+                input_messages=[genai_input_message("user", prompt)],
+            )
+            genai_handler.start_workflow(genai_workflow)
+
         agent_trace: list[dict[str, str]] = []
 
-        orchestrator, duration = call_agent(
-            "orchestrator_agent",
-            "Orchestrator Agent",
-            "You are the Orchestrator Agent for a recipe shopping app. Decide whether the user prompt is recipe, meal-planning, grocery, ingredient, cooking, entertaining menu, or substitution related. Extract the user's cooking intent, likely servings, constraints, and requested meals. Do not create the shopping cart. Prepare structured context for specialist agents.",
-            prompt,
-            ORCHESTRATOR_SCHEMA,
-        )
-        agent_trace.append(trace_event("context", "Orchestrator Agent", orchestrator["traceDetail"], duration))
+        try:
+            orchestrator, duration = call_agent(
+                "orchestrator_agent",
+                "Orchestrator Agent",
+                "You are the Orchestrator Agent for a recipe shopping app. Decide whether the user prompt is recipe, meal-planning, grocery, ingredient, cooking, entertaining menu, or substitution related. Extract the user's cooking intent, likely servings, constraints, and requested meals. Do not create the shopping cart. Prepare structured context for specialist agents.",
+                prompt,
+                ORCHESTRATOR_SCHEMA,
+            )
+            agent_trace.append(trace_event("context", "Orchestrator Agent", orchestrator["traceDetail"], duration))
 
-        if not orchestrator["isRecipeRelated"]:
-            span.set_attribute("recipe.related", False)
-            return non_recipe_plan(orchestrator)
+            if not orchestrator["isRecipeRelated"]:
+                span.set_attribute("recipe.related", False)
+                result = non_recipe_plan(orchestrator)
+                if genai_workflow is not None:
+                    genai_workflow.final_output = clipped_text(result)
+                return result
 
-        recipe_plan, duration = call_agent(
-            "recipe_planner_agent",
-            "Recipe Planner Agent",
-            "You are the Recipe Planner Agent. Choose practical recipes or meal components that satisfy the orchestrator context. Return base ingredients with quantities and reasons. Include sides, garnishes, dessert, and substitutions when relevant. Do not group by supermarket aisle; a later agent owns catalog mapping and cart grouping.",
-            {"userPrompt": prompt, "orchestrator": orchestrator},
-            RECIPE_PLANNER_SCHEMA,
-        )
-        agent_trace.append(trace_event("recipe", "Recipe Planner Agent", recipe_plan["traceDetail"], duration))
+            recipe_plan, duration = call_agent(
+                "recipe_planner_agent",
+                "Recipe Planner Agent",
+                "You are the Recipe Planner Agent. Choose practical recipes or meal components that satisfy the orchestrator context. Return base ingredients with quantities and reasons. Include sides, garnishes, dessert, and substitutions when relevant. Do not group by supermarket aisle; a later agent owns catalog mapping and cart grouping.",
+                {"userPrompt": prompt, "orchestrator": orchestrator},
+                RECIPE_PLANNER_SCHEMA,
+            )
+            agent_trace.append(trace_event("recipe", "Recipe Planner Agent", recipe_plan["traceDetail"], duration))
 
-        product_cart, duration = call_agent(
-            "product_search_agent",
-            "Product Search Agent",
-            "You are the Product Search Agent. Map the recipe planner's ingredients into supermarket-style grocery products. Normalize duplicate ingredients, use customer-friendly product names, and group them by common supermarket aisle. Keep quantities practical for the stated servings.",
-            {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan},
-            GROUPED_CART_SCHEMA,
-        )
-        agent_trace.append(trace_event("product", "Product Search Agent", product_cart["traceDetail"], duration))
+            product_cart, duration = call_agent(
+                "product_search_agent",
+                "Product Search Agent",
+                "You are the Product Search Agent. Map the recipe planner's ingredients into supermarket-style grocery products. Normalize duplicate ingredients, use customer-friendly product names, and group them by common supermarket aisle. Keep quantities practical for the stated servings.",
+                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan},
+                GROUPED_CART_SCHEMA,
+            )
+            agent_trace.append(trace_event("product", "Product Search Agent", product_cart["traceDetail"], duration))
 
-        inventory_review, duration = call_agent(
-            "inventory_availability_agent",
-            "Inventory & Availability Agent",
-            "You are the Inventory & Availability Agent. Review the grouped cart for likely stock, freshness, and substitution issues. Keep the cart grouped by aisle, preserve useful items, and add clear substitution notes. Do not claim live inventory access; describe reasonable availability assumptions.",
-            {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "productCart": product_cart},
-            REVIEW_AGENT_SCHEMA,
-        )
-        agent_trace.append(trace_event("inventory", "Inventory & Availability Agent", inventory_review["traceDetail"], duration))
+            inventory_review, duration = call_agent(
+                "inventory_availability_agent",
+                "Inventory & Availability Agent",
+                "You are the Inventory & Availability Agent. Review the grouped cart for likely stock, freshness, and substitution issues. Keep the cart grouped by aisle, preserve useful items, and add clear substitution notes. Do not claim live inventory access; describe reasonable availability assumptions.",
+                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "productCart": product_cart},
+                REVIEW_AGENT_SCHEMA,
+            )
+            agent_trace.append(trace_event("inventory", "Inventory & Availability Agent", inventory_review["traceDetail"], duration))
 
-        promotion_review, duration = call_agent(
-            "loyalty_promotions_agent",
-            "Loyalty & Promotions Agent",
-            "You are the Loyalty & Promotions Agent. Review the cart for sensible savings, bulk-buy, pantry-staple, and optional add-on opportunities. Keep the grouped cart intact unless a small practical adjustment improves the customer experience. Add concise customer notes and optional items. Do not invent exact coupons or live prices.",
-            {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "inventoryReview": inventory_review},
-            REVIEW_AGENT_SCHEMA,
-        )
-        agent_trace.append(trace_event("promotions", "Loyalty & Promotions Agent", promotion_review["traceDetail"], duration))
+            promotion_review, duration = call_agent(
+                "loyalty_promotions_agent",
+                "Loyalty & Promotions Agent",
+                "You are the Loyalty & Promotions Agent. Review the cart for sensible savings, bulk-buy, pantry-staple, and optional add-on opportunities. Keep the grouped cart intact unless a small practical adjustment improves the customer experience. Add concise customer notes and optional items. Do not invent exact coupons or live prices.",
+                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "inventoryReview": inventory_review},
+                REVIEW_AGENT_SCHEMA,
+            )
+            agent_trace.append(trace_event("promotions", "Loyalty & Promotions Agent", promotion_review["traceDetail"], duration))
 
-        built_cart, duration = call_agent(
-            "shopping_list_builder_agent",
-            "Shopping List Builder Agent",
-            "You are the Shopping List Builder Agent. Finalize the cart for a customer-facing grocery app. Deduplicate items, keep aisle grouping tidy, and ensure each product has a clear quantity and shopping reason. Preserve substitution, optional item, and note guidance from upstream agents.",
-            {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "promotionReview": promotion_review},
-            REVIEW_AGENT_SCHEMA,
-        )
-        agent_trace.append(trace_event("builder", "Shopping List Builder Agent", built_cart["traceDetail"], duration))
+            built_cart, duration = call_agent(
+                "shopping_list_builder_agent",
+                "Shopping List Builder Agent",
+                "You are the Shopping List Builder Agent. Finalize the cart for a customer-facing grocery app. Deduplicate items, keep aisle grouping tidy, and ensure each product has a clear quantity and shopping reason. Preserve substitution, optional item, and note guidance from upstream agents.",
+                {"userPrompt": prompt, "orchestrator": orchestrator, "recipePlan": recipe_plan, "promotionReview": promotion_review},
+                REVIEW_AGENT_SCHEMA,
+            )
+            agent_trace.append(trace_event("builder", "Shopping List Builder Agent", built_cart["traceDetail"], duration))
 
-        final_response, duration = call_agent(
-            "final_response_agent",
-            "Final Response Agent",
-            "You are the Final Response Agent for MarketMate. Write a concise customer-facing summary and helpful notes for the completed cart. Do not change the cart. Explain the plan in polished shopping-app language.",
-            {"userPrompt": prompt, "orchestrator": orchestrator, "builtCart": built_cart},
-            FINAL_AGENT_SCHEMA,
-        )
-        agent_trace.append(trace_event("final-response", "Final Response Agent", final_response["traceDetail"], duration))
+            final_response, duration = call_agent(
+                "final_response_agent",
+                "Final Response Agent",
+                "You are the Final Response Agent for MarketMate. Write a concise customer-facing summary and helpful notes for the completed cart. Do not change the cart. Explain the plan in polished shopping-app language.",
+                {"userPrompt": prompt, "orchestrator": orchestrator, "builtCart": built_cart},
+                FINAL_AGENT_SCHEMA,
+            )
+            agent_trace.append(trace_event("final-response", "Final Response Agent", final_response["traceDetail"], duration))
 
-        item_count = sum(len(group["items"]) for group in built_cart["groups"])
-        span.set_attribute("recipe.related", True)
-        span.set_attribute("cart.item_count", item_count)
-        span.set_attribute("cart.group_count", len(built_cart["groups"]))
+            item_count = sum(len(group["items"]) for group in built_cart["groups"])
+            span.set_attribute("recipe.related", True)
+            span.set_attribute("cart.item_count", item_count)
+            span.set_attribute("cart.group_count", len(built_cart["groups"]))
 
-        return {
-            "isRecipeRelated": True,
-            "summary": final_response["summary"],
-            "agentTrace": agent_trace,
-            "groups": built_cart["groups"],
-            "substitutions": built_cart["substitutions"],
-            "optionalItems": built_cart["optionalItems"],
-            "customerNotes": (built_cart["customerNotes"] + final_response["customerNotes"])[:8],
-        }
+            result = {
+                "isRecipeRelated": True,
+                "summary": final_response["summary"],
+                "agentTrace": agent_trace,
+                "groups": built_cart["groups"],
+                "substitutions": built_cart["substitutions"],
+                "optionalItems": built_cart["optionalItems"],
+                "customerNotes": (built_cart["customerNotes"] + final_response["customerNotes"])[:8],
+            }
+            if genai_workflow is not None:
+                genai_workflow.final_output = clipped_text(result)
+            return result
+        finally:
+            if GENAI_ENABLED and genai_handler and genai_workflow is not None:
+                genai_handler.stop_workflow(genai_workflow)
 
 
 class MarketMateHandler(BaseHTTPRequestHandler):
@@ -514,6 +606,7 @@ def main() -> None:
     print(f"MarketMate Python running at http://localhost:{PORT}")
     print(f"LLM model: {MODEL}")
     print(f"OpenTelemetry: {'enabled' if OTEL_ENABLED else 'not installed; install requirements.txt to enable'}")
+    print(f"Splunk GenAI telemetry: {'enabled' if GENAI_ENABLED else 'not installed; install requirements.txt to enable'}")
     ThreadingHTTPServer(("127.0.0.1", PORT), MarketMateHandler).serve_forever()
 
 

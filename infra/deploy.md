@@ -16,6 +16,8 @@ This template is designed to be free-tier eligible, not guaranteed free:
 - The Splunk Distribution of OpenTelemetry Collector is installed using Splunk's Linux installer script.
 - The app exports OTLP traces to the local collector at `http://127.0.0.1:4318/v1/traces`.
 - The app and collector set `deployment.environment=marketmate` by default.
+- The app includes Splunk AI Agent Monitoring code-based GenAI instrumentation via `splunk-otel-util-genai`.
+- The app venv uses Python 3.11 because Splunk AI Agent Monitoring requires Python 3.10+ and Amazon Linux 2023's system Python is 3.9.
 - Splunk and OpenAI secrets are read from encrypted SSM SecureString parameters at boot.
 
 Before creating the stack, confirm your EC2 Free Tier eligibility in AWS Billing/EC2. AWS’s current docs say Free Tier details differ based on whether the account was created before or after July 15, 2025. AWS also charges public IPv4 addresses, though EC2 Free Tier includes 750 public IPv4 hours/month for eligible accounts during the Free Tier period.
