@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import ssl
 import subprocess
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -15,14 +17,28 @@ from typing import Any
 
 ROOT = Path(__file__).parent
 STATIC_ROOT = ROOT / "static"
+HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "5273"))
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_URL = "https://api.openai.com/v1/responses"
+CURRENT_WORKFLOW_RUN_ID: str | None = None
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+app_logger = logging.getLogger("marketmate")
+app_logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
 
 try:
     from opentelemetry import trace
+    from opentelemetry import _logs
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, ConsoleLogExporter, SimpleLogRecordProcessor
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor
@@ -41,6 +57,15 @@ try:
 
     trace.set_tracer_provider(provider)
     tracer = trace.get_tracer("marketmate.agents")
+
+    log_provider = LoggerProvider(resource=resource)
+    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        log_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+    else:
+        log_provider.add_log_record_processor(SimpleLogRecordProcessor(ConsoleLogExporter()))
+    _logs.set_logger_provider(log_provider)
+    app_logger.addHandler(LoggingHandler(level=logging.INFO, logger_provider=log_provider))
+
     OTEL_ENABLED = True
 except ModuleNotFoundError:
     OTEL_ENABLED = False
@@ -303,6 +328,7 @@ def genai_input_message(role: str, content: Any) -> Any:
 
 def call_agent(name: str, title: str, instructions: str, input_data: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], int]:
     started_at = time.monotonic()
+    app_logger.info("agent.start name=%s title=%s model=%s", name, title, MODEL)
 
     with tracer.start_as_current_span(f"agent.{name}") as span:
         span.set_attribute("agent.name", title)
@@ -335,6 +361,8 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
                 genai_input_message("system", instructions),
                 genai_input_message("user", input_text),
             ]
+            agent_run_id = str(uuid.uuid4())
+            llm_run_id = str(uuid.uuid4())
             genai_agent = AgentInvocation(
                 name=title,
                 agent_type=name.replace("_agent", ""),
@@ -342,6 +370,9 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
                 system_instructions=instructions,
                 input_messages=input_messages,
             )
+            genai_agent.run_id = agent_run_id
+            if CURRENT_WORKFLOW_RUN_ID:
+                genai_agent.parent_run_id = CURRENT_WORKFLOW_RUN_ID
             genai_handler.start_agent(genai_agent)
 
             genai_llm = LLMInvocation(
@@ -349,6 +380,8 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
                 operation="responses",
                 input_messages=input_messages,
             )
+            genai_llm.run_id = llm_run_id
+            genai_llm.parent_run_id = agent_run_id
             genai_llm.provider = "openai"
             genai_llm.framework = "native-http"
             genai_handler.start_llm(genai_llm)
@@ -375,6 +408,7 @@ def call_agent(name: str, title: str, instructions: str, input_data: Any, schema
             if genai_agent is not None:
                 genai_agent.output_result = clipped_text(parsed)
 
+            app_logger.info("agent.complete name=%s title=%s duration_ms=%s", name, title, elapsed_ms)
             return parsed, elapsed_ms
         finally:
             if GENAI_ENABLED and genai_handler:
@@ -418,11 +452,16 @@ def non_recipe_plan(orchestrator: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_shopping_plan(prompt: str) -> dict[str, Any]:
+    global CURRENT_WORKFLOW_RUN_ID
+
     if not os.getenv("OPENAI_API_KEY"):
         raise AppError("OPENAI_API_KEY is not set. Start the app with OPENAI_API_KEY=your_key python app.py.", 503)
 
     with tracer.start_as_current_span("cart.response") as span:
         span.set_attribute("recipe.prompt_length", len(prompt))
+        app_logger.info("workflow.start prompt_length=%s", len(prompt))
+        previous_workflow_run_id = CURRENT_WORKFLOW_RUN_ID
+        CURRENT_WORKFLOW_RUN_ID = str(uuid.uuid4())
         genai_workflow = None
         if GENAI_ENABLED and genai_handler:
             genai_workflow = Workflow(
@@ -430,6 +469,7 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
                 workflow_type="multi_agent_recipe_cart",
                 input_messages=[genai_input_message("user", prompt)],
             )
+            genai_workflow.run_id = CURRENT_WORKFLOW_RUN_ID
             genai_handler.start_workflow(genai_workflow)
 
         agent_trace: list[dict[str, str]] = []
@@ -521,16 +561,23 @@ def create_shopping_plan(prompt: str) -> dict[str, Any]:
             }
             if genai_workflow is not None:
                 genai_workflow.final_output = clipped_text(result)
+            app_logger.info(
+                "workflow.complete recipe_related=true cart_item_count=%s cart_group_count=%s",
+                item_count,
+                len(built_cart["groups"]),
+            )
             return result
         finally:
             if GENAI_ENABLED and genai_handler and genai_workflow is not None:
                 genai_handler.stop_workflow(genai_workflow)
+            CURRENT_WORKFLOW_RUN_ID = previous_workflow_run_id
 
 
 class MarketMateHandler(BaseHTTPRequestHandler):
     server_version = "MarketMatePython/1.0"
 
     def do_POST(self) -> None:
+        request_started_at = time.monotonic()
         with tracer.start_as_current_span("http.post.recipe_plan") as span:
             span.set_attribute("http.request.method", "POST")
             span.set_attribute("url.path", self.path)
@@ -553,16 +600,29 @@ class MarketMateHandler(BaseHTTPRequestHandler):
 
                 result = create_shopping_plan(prompt.strip())
                 self.send_json(200, result)
+                app_logger.info(
+                    "http.request method=POST path=%s status=200 duration_ms=%s",
+                    self.path,
+                    int((time.monotonic() - request_started_at) * 1000),
+                )
             except AppError as error:
                 span.record_exception(error)
                 span.set_status(Status(StatusCode.ERROR))
                 self.send_json(error.status, {"error": str(error)})
+                app_logger.warning(
+                    "http.request method=POST path=%s status=%s error=%s",
+                    self.path,
+                    error.status,
+                    error,
+                )
             except Exception as error:
                 span.record_exception(error)
                 span.set_status(Status(StatusCode.ERROR))
                 self.send_json(500, {"error": str(error) or "Unexpected server error."})
+                app_logger.exception("http.request method=POST path=%s status=500", self.path)
 
     def do_GET(self) -> None:
+        request_started_at = time.monotonic()
         with tracer.start_as_current_span("http.get.static") as span:
             span.set_attribute("http.request.method", "GET")
             span.set_attribute("url.path", self.path)
@@ -584,6 +644,14 @@ class MarketMateHandler(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
+            app_logger.info(
+                "http.request method=GET path=%s status=200 duration_ms=%s",
+                self.path,
+                int((time.monotonic() - request_started_at) * 1000),
+            )
+
+    def log_message(self, format: str, *args: Any) -> None:
+        app_logger.info("http.server client=%s message=%s", self.client_address[0], format % args)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         content = json.dumps(payload).encode("utf-8")
@@ -603,11 +671,11 @@ class MarketMateHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    print(f"MarketMate Python running at http://localhost:{PORT}")
-    print(f"LLM model: {MODEL}")
-    print(f"OpenTelemetry: {'enabled' if OTEL_ENABLED else 'not installed; install requirements.txt to enable'}")
-    print(f"Splunk GenAI telemetry: {'enabled' if GENAI_ENABLED else 'not installed; install requirements.txt to enable'}")
-    ThreadingHTTPServer(("127.0.0.1", PORT), MarketMateHandler).serve_forever()
+    app_logger.info("MarketMate Python running at http://%s:%s", HOST, PORT)
+    app_logger.info("LLM model: %s", MODEL)
+    app_logger.info("OpenTelemetry: %s", "enabled" if OTEL_ENABLED else "not installed; install requirements.txt to enable")
+    app_logger.info("Splunk GenAI telemetry: %s", "enabled" if GENAI_ENABLED else "not installed; install requirements.txt to enable")
+    ThreadingHTTPServer((HOST, PORT), MarketMateHandler).serve_forever()
 
 
 if __name__ == "__main__":
