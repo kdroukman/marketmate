@@ -16,6 +16,7 @@ This template is designed to be free-tier eligible, not guaranteed free:
 - The Splunk Distribution of OpenTelemetry Collector is installed using Splunk's Linux installer script.
 - The app exports OTLP traces to the local collector at `http://127.0.0.1:4318/v1/traces`.
 - The app and collector set `deployment.environment=marketmate` by default.
+- Splunk and OpenAI secrets are read from encrypted SSM SecureString parameters at boot.
 
 Before creating the stack, confirm your EC2 Free Tier eligibility in AWS Billing/EC2. AWS’s current docs say Free Tier details differ based on whether the account was created before or after July 15, 2025. AWS also charges public IPv4 addresses, though EC2 Free Tier includes 750 public IPv4 hours/month for eligible accounts during the Free Tier period.
 
@@ -34,7 +35,8 @@ aws cloudformation create-stack \
     ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
     ParameterKey=SubnetId,ParameterValue=subnet-xxxxxxxx \
     ParameterKey=AppIngressCidr,ParameterValue=YOUR_IP/32 \
-    ParameterKey=SplunkAccessToken,ParameterValue=YOUR_SPLUNK_ACCESS_TOKEN \
+    ParameterKey=SplunkAccessTokenParameterName,ParameterValue=/marketmate/splunk/access-token \
+    ParameterKey=OpenAIApiKeyParameterName,ParameterValue=/marketmate/openai/api-key \
     ParameterKey=SplunkRealm,ParameterValue=us1 \
     ParameterKey=EnvironmentName,ParameterValue=marketmate
 ```
@@ -50,13 +52,20 @@ aws cloudformation describe-stacks \
 
 ## Add the OpenAI API Key on EC2
 
-The template intentionally does not put `OPENAI_API_KEY` in CloudFormation. After the instance is running, connect with Session Manager and create:
+Before creating the stack, create encrypted SSM parameters:
 
 ```bash
-sudo mkdir -p /etc/marketmate
-printf 'OPENAI_API_KEY=%s\n' 'YOUR_OPENAI_KEY' | sudo tee /etc/marketmate/marketmate.env >/dev/null
-sudo chmod 600 /etc/marketmate/marketmate.env
-sudo systemctl restart marketmate
+aws ssm put-parameter \
+  --name /marketmate/splunk/access-token \
+  --type SecureString \
+  --value YOUR_SPLUNK_ACCESS_TOKEN \
+  --overwrite
+
+aws ssm put-parameter \
+  --name /marketmate/openai/api-key \
+  --type SecureString \
+  --value YOUR_OPENAI_API_KEY \
+  --overwrite
 ```
 
 ## Update App Code
