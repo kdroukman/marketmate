@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MarketMate</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <a class="brand" href="#" aria-label="MarketMate home">
+          <span class="brand-mark">M</span>
+          <span>
+            <strong>MarketMate</strong>
+            <small>Recipe shopping</small>
+          </span>
+        </a>
+        <nav class="nav-tabs" aria-label="Primary">
+          <a class="active" href="#">Planner</a>
+          <a href="#">Orders</a>
+          <a href="#">Pantry</a>
+        </nav>
+        <div class="header-actions">
+          <button class="icon-button" id="resetPrompt" title="Reset planner" aria-label="Reset planner">↺</button>
+          <span class="profile-chip">KH</span>
+        </div>
+      </header>
+
+      <main class="shopping-app">
+        <section class="planner-column">
+          <div class="planner-hero">
+            <div>
+              <p class="eyebrow">Dinner to cart</p>
+              <h1>Build a grocery order from any recipe idea.</h1>
+            </div>
+            <div class="delivery-card">
+              <span>Delivery</span>
+              <strong>Tomorrow, 6-8pm</strong>
+              <small>Substitutions allowed</small>
+            </div>
+          </div>
+
+          <section class="composer panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Recipe request</p>
+                <h2>What are we cooking?</h2>
+              </div>
+              <span class="status-pill pending" id="approvalStatus">Pending</span>
+            </div>
+            <textarea id="plannerPrompt" spellcheck="false">Make me a shopping list based on my weekly dinner planner -
+Monday: Chicken Kiev, Tuesday: Steak, Wednesday: Any Fish recipe, Thursday: Vegetarian Dish, Friday: Pasta.
+Include some side dishes and garnish options.</textarea>
+            <div class="composer-actions">
+              <button class="primary-button" id="runWorkflow">Create shopping list</button>
+              <button class="ghost-button" id="reviseList" disabled>Edit request</button>
+            </div>
+          </section>
+
+          <section class="cart-panel panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Smart cart</p>
+                <h2>Your grocery list</h2>
+              </div>
+              <span id="itemCount" class="item-count">0 items</span>
+            </div>
+            <div id="shoppingList" class="shopping-list empty">
+              Tell MarketMate what you want to cook and your shopping list will appear here.
+            </div>
+          </section>
+        </section>
+
+        <aside class="checkout-column">
+          <section class="order-summary panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Order summary</p>
+                <h2>Ready when you are</h2>
+              </div>
+            </div>
+            <div class="summary-row">
+              <span>Items</span>
+              <strong id="summaryItems">0</strong>
+            </div>
+            <div class="summary-row">
+              <span>Estimated savings</span>
+              <strong>$8.40</strong>
+            </div>
+            <div class="summary-row">
+              <span>Fulfilment</span>
+              <strong>Delivery</strong>
+            </div>
+            <button class="secondary-button" id="approveList" disabled>Approve cart</button>
+          </section>
+
+          <section class="activity-panel panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">AI agent activity</p>
+                <h2>Agent run status</h2>
+              </div>
+              <span id="traceCount">0/4</span>
+            </div>
+            <div class="progress-meter" aria-label="Planning progress">
+              <div id="progressFill"></div>
+            </div>
+            <ol id="traceList" class="trace-list"></ol>
+          </section>
+
+          <section class="workflow-strip" aria-label="Workflow status">
+            <span class="node user" data-step="prompt">Prompt</span>
+            <span class="node llm" data-step="orchestrator-plan">Understand</span>
+            <span class="node agent" data-step="orchestrator">Plan</span>
+            <span class="node agent" data-step="recipe">Recipes</span>
+            <span class="node tool" data-step="recipe-tool">Search</span>
+            <span class="node agent" data-step="context">Context</span>
+            <span class="node agent" data-step="product">Products</span>
+            <span class="node agent" data-step="inventory">Stock</span>
+            <span class="node agent" data-step="promotions">Offers</span>
+            <span class="node builder" data-step="builder">Cart</span>
+            <span class="node llm" data-step="final-response">Response</span>
+            <span class="node user" data-step="approval">Review</span>
+            <span class="node agent" data-step="checkout">Checkout</span>
+            <span class="node agent" data-step="delivery">Delivery</span>
+            <span class="node agent" data-step="notify">Notify</span>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <script src="script.js"></script>
+  </body>
+</html>
